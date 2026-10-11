@@ -45,6 +45,11 @@ mod resource_exhaustion {
         /// which is retried). Capture is then partial by definition, so the
         /// run fails closed instead of relabeling the error as a clean EOF.
         read_error: bool,
+        /// OS termination accounted for: the loop observed an exit or
+        /// the bounded reap recovered one. Orthogonal to `exit_code`
+        /// (signaled victims have no code) and to injected observation
+        /// faults (which discard the observation, never the cleanup).
+        reaped: bool,
         /// First stderr line from the launcher (`harness-limits: ...`),
         /// proving the CPU/stack caps were applied to this run. Empty when
         /// the launcher itself refused (fail-closed exit 99).
@@ -74,20 +79,33 @@ mod resource_exhaustion {
     /// 2s + reap 5s + completion 5s; every stage is finite.
     const JOIN_GRACE: Duration = Duration::from_secs(5);
 
-    /// Joins one reader handle inside the shared completion grace.
-    /// Returns true only when the handle was observed finished AND the
-    /// join succeeded: the single bounded-completion primitive used by
-    /// both the runner gate below and its deterministic proof test.
-    fn join_finished(handle: std::thread::JoinHandle<()>, end: Instant) -> bool {
+    /// Join verdict for one reader handle inside the shared completion
+    /// grace. `Unfinished` carries the SAME handle back so the caller can
+    /// release it and observe that thread's actual join — never a twin,
+    /// never detached-while-asserting-cleanup. `Panicked` means the thread
+    /// terminated by panicking (join returned, work failed).
+    enum JoinOutcome {
+        Joined,
+        Unfinished(std::thread::JoinHandle<()>),
+        Panicked,
+    }
+
+    /// Joins one reader handle inside the shared completion grace: the
+    /// single bounded-completion primitive used by both the runner gate
+    /// below and its deterministic proof test.
+    fn join_finished(handle: std::thread::JoinHandle<()>, end: Instant) -> JoinOutcome {
         let mut finished = handle.is_finished();
         while !finished && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(5));
             finished = handle.is_finished();
         }
         if !finished {
-            return false;
+            return JoinOutcome::Unfinished(handle);
         }
-        handle.join().is_ok()
+        match handle.join() {
+            Ok(()) => JoinOutcome::Joined,
+            Err(_) => JoinOutcome::Panicked,
+        }
     }
 
     /// Reads one pipe up to the cap. Retention is truncated BEFORE the
@@ -261,7 +279,7 @@ mod resource_exhaustion {
     // Test-only fault injection for the parent lifecycle: each flag
     // drives the real lifecycle path with exactly one hostile condition.
     // All flags stay off outside these tests.
-    #[derive(Clone, Copy, Default)]
+    #[derive(Clone, Default)]
     struct LifecycleFaults {
         /// Child poll fails: the parent must fail closed, never panic.
         fail_poll: bool,
@@ -269,6 +287,11 @@ mod resource_exhaustion {
         /// `read_error` with partial capture.
         fail_read: bool,
         /// Reaping never observes an exit: the unavailable-reap verdict.
+        /// Optional readiness gate for `fail_poll`: the fault fires only
+        /// after this file exists, proving the fixture victim truly live
+        /// under bounds before observation is broken. Without it the fault
+        /// could mask a spawn failure as poll breakage.
+        ready_file: Option<std::path::PathBuf>,
         reap_never: bool,
     }
 
@@ -343,7 +366,16 @@ mod resource_exhaustion {
                 // A failed poll is an unobservable child, never a panic: fail
                 // closed through the kill/reap path with a distinct verdict
                 // (incomplete, no exit, not mislabeled as a timeout below).
-                if faults.fail_poll {
+                // fail_poll fires only once the readiness file proves the
+                // victim truly live; before that the parent polls normally, so
+                // the fault can never mask a spawn/launch failure.
+                let armed = faults.fail_poll
+                    && faults
+                        .ready_file
+                        .as_ref()
+                        .map(|p| p.exists())
+                        .unwrap_or(true);
+                if armed {
                     poll_failed = true;
                     break;
                 }
@@ -395,13 +427,6 @@ mod resource_exhaustion {
             }
         }
         let mut incomplete_readers = bufs[0].is_none() || bufs[1].is_none() || read_error;
-        // Bounded join gate: a channel receipt proves its thread finished
-        // every blocking call (sending is the sender's last act before
-        // return), so joining after all receipts is bounded by construction
-        // to epilogue reclamation; std offers no timed join. Missing
-        // receipts skip the join (those threads stay detached) and fail the
-        // run as incomplete instead. A panicking reader surfaces here as
-        // incomplete too, never silent.
         // Bounded completion gate: a channel receipt proves its thread
         // finished every blocking call, but scheduling can pause the sender
         // between send and return, so a receipt is not the termination
@@ -415,8 +440,11 @@ mod resource_exhaustion {
         let completion_end = Instant::now() + JOIN_GRACE;
         if bufs[0].is_some() && bufs[1].is_some() {
             for reader in readers {
-                if !join_finished(reader, completion_end) {
-                    incomplete_readers = true;
+                match join_finished(reader, completion_end) {
+                    JoinOutcome::Joined => {}
+                    JoinOutcome::Unfinished(_) | JoinOutcome::Panicked => {
+                        incomplete_readers = true;
+                    }
                 }
             }
         }
@@ -452,6 +480,11 @@ mod resource_exhaustion {
             oversized,
             incomplete_readers,
             read_error,
+            // OS termination accounted for: the loop observed an exit or
+            // the bounded reap recovered one. Independent of `exit_code`
+            // (signaled victims have no code) and of injected observation
+            // faults (which discard the observation, never the cleanup).
+            reaped: status.is_some() || really_reaped.is_some(),
             limits_note: String::new(),
             exit_code: status.and_then(|s| s.code()),
             stdout,
@@ -657,13 +690,14 @@ mod resource_exhaustion {
     #[test]
     fn harness_join_gate_proves_paused_sender_unfinished() {
         // A sender paused after send, driven through the ACTUAL
-        // `join_finished` gate the runner uses — not a parallel
-        // demonstration. The sender blocks on `release` right after
-        // sending, so it is alive by construction when the parent
-        // observes the receipt: no timing luck involved. The thread body
-        // after release is a bare return (no blocking calls), so the
-        // release below is a bounded cleanup path, watched by its own
-        // finite deadline.
+        // `join_finished` gate the runner uses. The sender blocks on
+        // `release` right after sending, so it is alive by construction
+        // when the parent observes the receipt: no timing luck involved.
+        // The thread body after release is a bare return (no blocking
+        // calls), so the release below is a bounded cleanup path watched
+        // by its own finite deadline. The SAME handle goes through both
+        // verdicts: unfinished first, then actually joined — never a twin,
+        // never detached-while-asserting-cleanup.
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let (rel_tx, rel_rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
@@ -673,64 +707,73 @@ mod resource_exhaustion {
         done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("sender ran to the pause point inside the readiness bound");
-        assert!(
-            !join_finished(handle, Instant::now() + Duration::from_millis(100)),
-            "paused-after-send thread must fail the gate inside a short grace"
-        );
-        // Release the negative-path thread at once: its receiver fails and
-        // it returns on its own (bare return, no blocking calls), so no
-        // detached thread outlives this test's scope.
+        let handle = match join_finished(handle, Instant::now() + Duration::from_millis(100)) {
+            JoinOutcome::Unfinished(h) => h,
+            JoinOutcome::Joined => panic!("paused-after-send thread must fail the gate"),
+            JoinOutcome::Panicked => panic!("paused sender must not panic"),
+        };
+        // Explicit release of THAT SAME thread with finite join cleanup:
+        // dropping the release sender unblocks the receiver with an error,
+        // the thread returns, and the gate joins it inside the watchdog.
         drop(rel_tx);
-        // The release twin below proves the same gate primitive joins a
-        // released thread inside the watchdog.
         let start = Instant::now();
-        // NOTE: the negative gate above consumed the handle; spawn the
-        // release twin whose only job is the bounded cleanup path.
-        let (done2_tx, done2_rx) = std::sync::mpsc::channel::<()>();
-        let (rel2_tx, rel2_rx) = std::sync::mpsc::channel::<()>();
-        let handle2 = std::thread::spawn(move || {
-            let _ = done2_tx.send(());
-            let _ = rel2_rx.recv();
-        });
-        done2_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("twin ran to the pause point inside the readiness bound");
-        drop(rel2_tx);
+        match join_finished(handle, start + Duration::from_secs(5)) {
+            JoinOutcome::Joined => {}
+            JoinOutcome::Unfinished(_) => panic!("released thread must join inside the watchdog"),
+            JoinOutcome::Panicked => panic!("released thread must not panic"),
+        }
         assert!(
-            join_finished(handle2, Instant::now() + Duration::from_secs(5)),
-            "released thread must join inside the watchdog"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < Duration::from_secs(5),
             "cleanup path bounded"
         );
     }
-
     #[test]
     fn harness_parent_verdict_covers_injected_faults() {
         // Poll failure against a TRULY LIVE child through the REAL parent
         // lifecycle: no panic, real termination in common cleanup, and a
         // verdict distinct from timeout. The orphaned `sleep` is self-bound
         // (30s); grandchildren cannot be reaped portably.
+        // Readiness file: the victim proves itself truly live under bounds
+        // before observation is broken. Direct exec replaces the shell, so
+        // killing closes the pipes at once with no orphan.
+        let ready = std::env::temp_dir().join(format!("syntax-poll-ready-{}", std::process::id()));
+        let script = format!("echo live > '{}'; exec sleep 30", ready.display());
         let start = Instant::now();
         let run = run_raw_bounded_with(
             "bash",
-            &["-c", "sleep 30"],
+            &["-c", &script],
             Duration::from_secs(5),
             LifecycleFaults {
                 fail_poll: true,
+                ready_file: Some(ready.clone()),
                 ..Default::default()
             },
         );
         let elapsed = start.elapsed();
+        let ready_seen = ready.exists();
+        std::fs::remove_file(&ready).ok();
         // The common cleanup really terminated the live child; the exit
         // comes back signaled (no code), and the verdict stays distinct
         // from a timeout (incomplete, exitless, no timeout label).
+        assert!(ready_seen, "victim proved truly live before poll breakage");
         assert_eq!(run.exit_code, None, "killed live child has no exit code");
+        assert!(
+            run.reaped,
+            "actual OS reap observed, separate from the exit verdict"
+        );
+        assert!(
+            run.limits_note.contains("stack=4096") && run.limits_note.contains("cpu=10"),
+            "effective caps read back: {}",
+            run.limits_note
+        );
         assert!(run.incomplete_readers, "poll failure fails the run visibly");
         assert!(
             !run.timed_out,
             "poll failure must not be mislabeled as a timeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "cleanup bounded without waiting for any descendant: {elapsed:?}"
         );
         assert!(
             elapsed < Duration::from_secs(15),
@@ -757,15 +800,14 @@ mod resource_exhaustion {
             "partial capture fails the run visibly"
         );
         // Unavailable reap through the REAL parent verdict: the victim is
-        // killed on the deadline but its exit can never be observed.
-        let mut c = Command::new("bash");
-        c.args(["-c", "while true; do :; done"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        // killed on the deadline but its exit can never be observed. Runs
+        // under the fail-closed launcher so the effective bounds apply;
+        // the injected verdict (None) stays separate from the successful
+        // OS cleanup the runner still performs (no zombies by construction).
         let start = Instant::now();
-        let run = run_command_bounded_with(
-            c,
+        let run = run_raw_bounded_with(
+            "bash",
+            &["-c", "while true; do :; done"],
             Duration::from_secs(2),
             LifecycleFaults {
                 reap_never: true,
@@ -779,6 +821,15 @@ mod resource_exhaustion {
             "unavailable reap fails the run visibly"
         );
         assert!(run.timed_out, "the deadline did trip");
+        assert!(
+            run.reaped,
+            "real OS cleanup ran despite discarded observation"
+        );
+        assert!(
+            run.limits_note.contains("stack=4096") && run.limits_note.contains("cpu=10"),
+            "effective caps read back: {}",
+            run.limits_note
+        );
         assert!(
             elapsed < Duration::from_secs(12),
             "deadline 2s + drain 2s + reap 5s bound the run: {elapsed:?}"
@@ -968,36 +1019,88 @@ mod resource_exhaustion {
 
     /// An exited child with descendant-retained pipes: the exit is observed
     /// but readers never finish. The helper must report incomplete readers
-    /// within bounds, not wait forever. Real bash (not the CLI) is the
-    /// pipe holder here; the orphaned `sleep` is harmless and bounded.
-    /// The sleeper's own 30s lifetime is the outer deadline (grandchildren
-    /// cannot be reaped portably); the elapsed assertion proves the run
-    /// returns without waiting for it.
+    /// within bounds, not wait forever. Runs under the fail-closed launcher;
+    /// because the retained pipes keep even the launcher's own readback
+    /// line unread, the effective bounds are proven through a per-process
+    /// receipt file the fixture shell writes before parking the sleeper
+    /// (removed below). The sleeper's own 30s lifetime is the outer
+    /// deadline (grandchildren cannot be reaped portably); the elapsed
+    /// assertion proves the run returns without waiting for it.
     #[test]
     fn bounded_helper_flags_retained_pipes() {
-        // Runs direct (no launcher): readback needs drained capture,
-        // which the retained-pipe verdict precludes by design — the
-        // launcher's own readback line sits unread in the held pipe. The
-        // launcher-bound timeout/overflow/consumer tests prove the
-        // effective bounds; this fixture proves the incomplete verdict.
-        let mut cmd = Command::new("bash");
-        cmd.args(["-c", "sleep 30 & exit 0"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        // The sleeper's PID is retained through a second receipt file so
+        // the test itself terminates and finitely observes the exact
+        // descendant it created — no waiting for the 30s self-expiry, no
+        // universal process-tree reaper, just test-scoped cleanup of owned
+        // resources. Unique per process; removed below.
+        let receipt =
+            std::env::temp_dir().join(format!("syntax-retained-limits-{}", std::process::id()));
+        let pidfile =
+            std::env::temp_dir().join(format!("syntax-retained-pid-{}", std::process::id()));
+        let script = format!(
+            "ulimit -s > '{}'; ulimit -t >> '{}'; sleep 30 & echo $! > '{}'; exit 0",
+            receipt.display(),
+            receipt.display(),
+            pidfile.display()
+        );
         let start = Instant::now();
-        let run = run_command_bounded(cmd, Duration::from_secs(5));
+        let run = run_raw_bounded("bash", &["-c", &script], Duration::from_secs(5));
         let elapsed = start.elapsed();
+        let receipt_text =
+            std::fs::read_to_string(&receipt).expect("fixture shell ran under the launcher");
+        std::fs::remove_file(&receipt).ok();
+        // Controlled descendant cleanup AFTER the negative verdict above:
+        // terminate the exact retained sleeper and finitely observe its
+        // completion (absence via kill -0 polling inside a 5s bound).
+        // The orphan is reparented to init on the shell's death, so init
+        // reaps it promptly after the kill; the poll proves it is gone.
+        let sleeper = std::fs::read_to_string(&pidfile)
+            .expect("fixture recorded its descendant identity")
+            .trim()
+            .to_string();
+        std::fs::remove_file(&pidfile).ok();
+        let kill_ok = Command::new("kill")
+            .args(["-9", &sleeper])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(kill_ok, "owned descendant {sleeper} terminated");
+        let gone_start = Instant::now();
+        loop {
+            let alive = Command::new("kill")
+                .args(["-0", &sleeper])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            assert!(
+                gone_start.elapsed() < Duration::from_secs(5),
+                "descendant {sleeper} completion observed inside the cleanup bound"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let total = start.elapsed();
         assert!(!run.timed_out, "exited child misreported as timeout");
         assert!(
             run.incomplete_readers,
             "retained pipes not reported as incomplete"
         );
         assert!(!run.read_error, "open pipes are not I/O errors");
+        assert!(
+            receipt_text.lines().next() == Some("4096")
+                && receipt_text.lines().nth(1) == Some("10"),
+            "effective stack/cpu bounds applied to the fixture: {receipt_text:?}"
+        );
         assert_eq!(run.exit_code, Some(0), "stdout: {}", run.stdout);
         assert!(
             elapsed < Duration::from_secs(15),
             "returned in {elapsed:?} without waiting for the 30s sleeper"
+        );
+        assert!(
+            total < Duration::from_secs(20),
+            "verdict plus descendant cleanup bounded end to end: {total:?}"
         );
     }
 
