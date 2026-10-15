@@ -130,15 +130,28 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("npm view @everruns/bashkit", step)
         self.assertIn("exit 1", step)
 
-    def test_cli_publish_proxy_uses_the_published_core(self) -> None:
+    def test_release_check_verifies_the_exact_unpublished_package_graph(self) -> None:
         justfile = (ROOT / "justfile").read_text()
+        recipe = justfile.split("\nrelease-check:\n", 1)[1].split("\n# Create and push", 1)[0]
 
-        # The proxy manifest rewrite lives in scripts/cli_publish_proxy.py so it
-        # can be unit tested; release-check must still call it.
-        self.assertIn(
-            'python3 scripts/cli_publish_proxy.py "$CLI_TOML" "$LATEST_CORE"', justfile
-        )
-        self.assertTrue((ROOT / "scripts/cli_publish_proxy.py").is_file())
+        # New internal dependencies are absent from crates.io until publication.
+        # Cargo stages them together only when every release package is selected.
+        for package in ("bashkit-cpython-wasm", "bashkit", "bashkit-cli", "bashkit-scripted-tool"):
+            self.assertRegex(recipe, rf"-p {package}(?:\s|$)")
+        self.assertIn("--dry-run", recipe)
+        self.assertNotIn("--no-verify", recipe)
+        self.assertNotIn("LATEST_CORE", recipe)
+        self.assertNotIn("cli_publish_proxy", recipe)
+
+    def test_homebrew_release_metadata_matches_repository_policy(self) -> None:
+        workflow = (ROOT / ".github/workflows/cli-binaries.yml").read_text()
+
+        self.assertIn('git config user.name "Mykhailo Chalyi"', workflow)
+        self.assertIn('git config user.email "mike@chaliy.name"', workflow)
+        self.assertNotIn("github-actions[bot]", workflow)
+        license_match = re.search(r'^license = "([^"]+)"', (ROOT / "Cargo.toml").read_text(), re.MULTILINE)
+        self.assertIsNotNone(license_match)
+        self.assertIn(f'license "{license_match.group(1)}"', workflow)
 
     def test_web_ci_exercises_release_wasm_optimization(self) -> None:
         build_script = (ROOT / "crates/bashkit-wasm/scripts/build.sh").read_text()
