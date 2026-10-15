@@ -9426,7 +9426,7 @@ impl Interpreter {
             }
 
             // Handle input redirections first
-            let stdin = match self
+            let stdin_setup = match self
                 .process_input_redirections(
                     stdin,
                     &command.redirects,
@@ -9441,6 +9441,10 @@ impl Interpreter {
                 }
                 Err(e) => return Err(e),
             };
+            // Keep the materialized stdin's byte/text storage admitted
+            // for as long as the command retains it.
+            let _stdin_storage = stdin_setup.stdin_lease;
+            let stdin = stdin_setup.stdin;
 
             // `read -u FD` on a readable fd (`exec 3<f`, a coproc): its
             // next line is stdin.
@@ -12914,7 +12918,7 @@ impl Interpreter {
             // WTF: a coproc fd as a compound's stdin (`while read l; do
             // ...; done <&${C[0]}`) is read to end of input up front, not
             // line by line as the loop runs.
-            let stdin = match self
+            let stdin_setup = match self
                 .process_input_redirections(None, redirects, StdinDemand::All, HighFdStdin::Any)
                 .await
             {
@@ -12924,6 +12928,9 @@ impl Interpreter {
                 }
                 Err(e) => return Err(e),
             };
+            // Keep stdin's byte/text storage admitted through the body.
+            let _stdin_storage = stdin_setup.stdin_lease;
+            let stdin = stdin_setup.stdin;
             let prev_pipeline_stdin = if stdin.is_some() {
                 let prev = self.pipeline_stdin.take();
                 self.pipeline_stdin = stdin;
@@ -13020,10 +13027,12 @@ impl Interpreter {
                     .await
                 };
                 match read {
-                    Ok(content) => {
-                        if let Some(content) = content {
-                            // Account for the VFS-owned input while it and the
-                            // decoded substitution text are simultaneously live.
+                    Ok(setup) => {
+                        // Retain admitted input storage through substitution.
+                        let _stdin_storage = setup.stdin_lease;
+                        if let Some(content) = setup.stdin {
+                            // Cover the temporary byte copy made by the
+                            // command-substitution text boundary.
                             let _content_lease =
                                 self.execution_budget.lease_bytes(content.len())?;
                             stdout.try_push_str(&content.command_substitution_text())?;

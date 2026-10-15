@@ -172,6 +172,30 @@ plus the package-named `build/bashkit` *directory* not being mistaken for
 the binary and a decoy above the target directory being refused.
 `bashkit_cli_path()` fails closed naming every path it ruled out.
 
+## Command-local input admission
+
+`interpreter::redirection::input_admission_tests` uses two-byte ordinary and
+lazy files to check admission before loading, including the empty open for
+`<>`, exact byte/text storage boundaries, failed-admission refunds, surviving
+stdin storage, and injected cancellation during a read. `stream::tests` covers
+lossy decoding without changing bytes and capacity-owned copy boundaries.
+The ordinary `input_redirection_*` integration cases cover binary stdin/fd
+copies, empty read-write creation, existing-file preservation, here inputs,
+and tiny process-substitution input (including mapfile). A two-byte buffered
+pipe fixture checks admission and lease release while pipe stat stays zero
+and the existing substitution owner remains open. The owner exposes buffered
+length without copying; admission must precede its `read_file` copy.
+The cases also cover nonfatal missing-file diagnostics and enabled/disabled
+symlink-following for ordinary read/read-write input. These fixtures require no
+host mount: a two-byte in-memory mounted file without synthetic parent entries
+covers direct read, read-write/create and refusal before lazy loading. A missing
+canonical parent is not proof the backend cannot stat/read the original path.
+Two-byte overlay/read-only and rebased-namespace fixtures also check successful
+read, rejected read-write open with backend diagnostics, and unchanged content.
+These fixtures require no
+subprocess, device read, large allocation, or original resource-exhaustion shape. Selecting
+them is scoped proof, not a claim that the unchanged full/coverage suites ran.
+
 ## Coverage
 
 Uploaded to Codecov from three sources: Rust unit/integration coverage via
@@ -248,6 +272,35 @@ surfaces as a 404 in an already-green job.
 4. Record the limitation in [Known Limitations](limitations.md) (skip reason = evidence)
 
 ## Resource-cap tests must not race the deadline
+
+The opt-in input-redirect helper polls its one in-flight RSS sampling future by
+mutable reference across `select!` rounds. A losing branch must leave that future
+in its owned slot; only observing its result clears the slot. The ordinary
+`ir_helper_concurrent_schedule` fixture uses the wrapper's same
+`poll_owned_sample` helper with 64 bytes of in-memory pipe data and a release-gated
+future. This verifies scheduling ownership, not subprocess cleanup, effective
+resource caps, platform coverage or merged security proof.
+
+The native input-redirect runner shares one owned lifecycle for the main child
+and RSS sampler: wait, both capped captures and live first-failure notices are
+polled together. Ordinary errors request kill before finite reap/capture completion;
+completion waits for an owned pending sample and records incomplete cleanup as a
+negative verdict. Reap timeout, I/O failure and success are separate outcomes.
+The process feature is a native-only Tokio dev-dependency; WASM builds keep the
+workspace feature set. Drop remains a best-effort backstop, not evidence of
+reap or capture completion on panic or external cancellation. Tiny in-memory
+fixtures verify notice delivery before EOF, nested reap failures and pending-sample
+ownership. They do not establish subprocess, Linux or full security shipping proof.
+
+The input helper follows the shared sanitizer-compatible launcher
+policy: no virtual-AS cap; its receipt explicitly marks AS unsupported and
+labels resident-memory observations as sampled RSS with an unchanged 1 GiB
+cutoff, not hard OS enforcement or a between-sample peak guarantee. CPU 10s,
+stack 4096 KiB, file backstop 128 MiB on measured Bash units, separate artifact
+acceptance below 64 MiB, wall deadlines and capped drains remain unchanged.
+Backend-admission futures are boxed at the recursive redirect boundary to
+avoid embedding their state in each command frame; layout-only observations
+do not establish a depth-execution result.
 
 Controlled retained-pipe fixtures keep a caller-owned reader-handoff vector
 outside their cleanup guard. A bounded `Drop` returns any unfinished ORIGINAL
