@@ -35,9 +35,7 @@ export interface BuiltinRequest {
  * `Promise` of it. Async callbacks are only awaited by {@link Bash.execute}
  * (not `executeSync`). Throwing / rejecting becomes stderr with exit code 1.
  */
-export type CustomBuiltin = (
-  ctx: BuiltinRequest,
-) => string | Promise<string>;
+export type CustomBuiltin = (ctx: BuiltinRequest) => string | Promise<string>;
 
 /** Live byte I/O; handles are revoked when their execution ends. */
 export interface CommandContext {
@@ -52,8 +50,12 @@ export interface CommandContext {
   readonly stdout: { write(bytes: Uint8Array): Promise<void> };
   readonly stderr: { write(bytes: Uint8Array): Promise<void> };
 }
-export type CommandCallback = (ctx: CommandContext) => Promise<number | { exitCode: number }>;
+export type CommandCallback = (
+  ctx: CommandContext,
+) => Promise<number | { exitCode: number }>;
 export interface ExecuteOptions {
+  /** Text observer; use byte sinks with capture or AbortSignal. */
+  onOutput?: (stdout: string, stderr: string) => void;
   /** Maximum captured bytes per stream. Without capture, sinks retain no output. */
   capture?: number;
   stdout?: (bytes: Uint8Array) => void | Promise<void>;
@@ -138,7 +140,39 @@ export interface HostFileSystem {
 }
 
 /** Options for constructing a {@link Bash} instance. */
+/** Values shared by Python, TypeScript and the browser host (depth <= 64). */
+export type RuntimeValue =
+  | null
+  | boolean
+  | number
+  | string
+  | RuntimeValue[]
+  | { [key: string]: RuntimeValue };
+export interface HostFunctionContext {
+  signal: AbortSignal;
+}
+export type ExternalHandler = (
+  name: string,
+  args: RuntimeValue[],
+  kwargs: Record<string, RuntimeValue>,
+  context: HostFunctionContext,
+) => RuntimeValue | undefined | Promise<RuntimeValue | undefined>;
+export type TypeScriptExternalHandler = (
+  name: string,
+  args: RuntimeValue[],
+  context: HostFunctionContext,
+) => RuntimeValue | undefined | Promise<RuntimeValue | undefined>;
+
 export interface BashOptions {
+  /** Requires the optional /runtimes bundle; disabled by default. */
+  python?: boolean;
+  /** Requires the optional /runtimes bundle; disabled by default. */
+  typescript?: boolean;
+  externalFunctions?: string[];
+  externalHandler?: ExternalHandler;
+  typescriptExternalFunctions?: string[];
+  typescriptExternalHandler?: TypeScriptExternalHandler;
+
   /** Resource-policy baseline; individual limit options override it. */
   profile?: ExecutionProfileName;
   username?: string;
@@ -276,7 +310,14 @@ export class Bash {
 }
 
 /** Options for constructing a {@link Terminal}. */
-export interface TerminalOptions extends Omit<BashOptions, "commands"> {
+export interface TerminalOptions extends Omit<
+  BashOptions,
+  | "commands"
+  | "externalFunctions"
+  | "externalHandler"
+  | "typescriptExternalFunctions"
+  | "typescriptExternalHandler"
+> {
   /** Rows (default 24, min 2). */
   rows?: number;
   /** Columns (default 80, min 2). */
@@ -285,8 +326,7 @@ export interface TerminalOptions extends Omit<BashOptions, "commands"> {
 
 /** Result of {@link Terminal.runUntilIdle}. */
 export type TerminalStatus =
-  | { status: "idle" }
-  | { status: "exited"; exitCode: number };
+  { status: "idle" } | { status: "exited"; exitCode: number };
 
 /**
  * Interactive bash session on an in-memory terminal: keystrokes in,

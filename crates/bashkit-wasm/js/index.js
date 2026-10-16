@@ -7,30 +7,99 @@
 
 import init, * as glue from "./bashkit_wasm.js";
 
+import { validateHandlers, createDispatcher } from "./runtime-functions.js";
 const { ExecResult } = glue;
+const configs = new WeakMap();
 
+/** Browser interpreter. One active execution per instance; callbacks are execution-local. */
 export class Bash extends glue.Bash {
-  constructor(options) {
+  constructor(options = {}) {
+    options ??= {};
+    validateHandlers(options);
     super(options);
-    for (const [name, callback] of Object.entries(options?.commands ?? {})) this.addCommand(name, callback);
+    configs.set(this, { options: { ...options }, running: false });
+    for (const [name, callback] of Object.entries(options.commands ?? {}))
+      this.addCommand(name, callback);
   }
-  async execute(commands, options) {
-    const signal = options?.signal;
-    if (signal?.aborted) throw new DOMException("execution cancelled", "AbortError");
+
+  execute(commands, options = {}) {
+    const state = configs.get(this);
+    if (state.running)
+      return Promise.reject(
+        new Error(
+          "bash instance is busy (reentrant execution is not supported)",
+        ),
+      );
+    if (options.signal?.aborted)
+      return Promise.reject(
+        new DOMException("execution cancelled", "AbortError"),
+      );
+    if (
+      options.onOutput &&
+      (options.signal ||
+        options.capture !== undefined ||
+        options.stdout ||
+        options.stderr)
+    )
+      return Promise.reject(
+        new TypeError(
+          "use stdout/stderr byte sinks instead of combining onOutput with live execution options",
+        ),
+      );
+    const controller = new AbortController();
     let aborted = false;
-    const onAbort = () => { aborted = true; this.cancel(); };
-    signal?.addEventListener("abort", onAbort, { once: true });
-    try { return await super.execute(commands, options); }
-    finally {
-      signal?.removeEventListener("abort", onAbort);
+    const cancel = () => {
+      aborted = true;
+      this.cancel();
+      controller.abort();
+    };
+    state.running = true;
+    options.signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      const host =
+        state.options.externalHandler ||
+        state.options.typescriptExternalHandler;
+      const result = host
+        ? super.executeWithRuntime(
+            commands,
+            createDispatcher(state.options, controller.signal),
+            options.onOutput,
+            options,
+          )
+        : options.onOutput
+          ? super.executeWithOutput(commands, options.onOutput)
+          : super.execute(commands, options);
+      return result.finally(() => {
+        state.running = false;
+        options.signal?.removeEventListener("abort", cancel);
+        if (aborted) this.clearCancel();
+        controller.abort();
+      });
+    } catch (error) {
+      state.running = false;
+      options.signal?.removeEventListener("abort", cancel);
       if (aborted) this.clearCancel();
+      controller.abort();
+      return Promise.reject(error);
     }
   }
+
   executeSync(commands, options) {
-    if (options && (options.capture !== undefined || options.stdout || options.stderr)) {
+    if (
+      options &&
+      (options.capture !== undefined || options.stdout || options.stderr)
+    )
       throw new TypeError("streaming I/O requires async execute()");
-    }
     return super.executeSync(commands);
+  }
+
+  executeWithOutput(commands, onOutput) {
+    return this.execute(commands, { onOutput });
+  }
+
+  reset() {
+    if (configs.get(this).running) throw new Error("bash instance is busy");
+    return super.reset();
   }
 }
 

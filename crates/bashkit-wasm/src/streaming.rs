@@ -174,6 +174,7 @@ pub(super) async fn execute(
     bash: &mut CoreBash,
     script: &str,
     options: JsValue,
+    exec_options: bashkit::ExecOptions,
 ) -> Result<CoreExecResult, JsValue> {
     let stdout = sink(&options, "stdout")?;
     let stderr = sink(&options, "stderr")?;
@@ -189,9 +190,12 @@ pub(super) async fn execute(
     let explicit_output = stdout.is_some() || stderr.is_some() || !capture.is_undefined();
     let live = explicit_output || has_signal;
     if !live {
-        return bash.exec(script).await.map_err(js_error);
+        return bash
+            .exec_with_options(script, exec_options)
+            .await
+            .map_err(js_error);
     }
-    let mut execution = bash.execute(script);
+    let mut execution = bash.execute(script).options(exec_options);
     if has_signal && !explicit_output {
         // Signal-only execution keeps the buffered convenience result while
         // using the driver that interrupts pending host Promises.

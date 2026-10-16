@@ -2,6 +2,10 @@
 
 ## 2026-10-16
 
+* **Browser live runtime callbacks**: Integrated the runtime dispatcher with live byte sinks, bounded capture and command pipelines after the streaming API landed. Both execution paths retain request-local leases; tests cover async sink completion/deadlines, abort/reuse, reset and caller context. See [Browser Package](runtimes/browser-package.md).
+
+* **Browser runtime parity**: Added the optional `/runtimes` import with embedded Python/TypeScript and named host callbacks. Slim default imports keep their VM-free binary. Browser callbacks use revocable execution sessions and AbortSignal; Python host waits now use the portable timer, and a hash-checked browser-only ZapCode copy preserves deadlines with platform clocks. Added worker, Chromium/no-isolation, cancellation, VFS/persistence and npm-archive coverage. See [Browser Package](runtimes/browser-package.md) and [ZapCode Runtime](runtimes/zapcode-runtime.md).
+
 * **C streaming callbacks**: Integrated C ABI runtime host functions with live output. Buffered and streaming entry points share admission guards, and output callbacks reject blocking reentry on any handle before a nested runtime can start. Combined tests cover immediate/cross-thread replies, capture and discard, caller affinity, and recursive streaming calls. See [C API](runtimes/c-api.md).
 
 * **C runtime parity**: Added optional Python/TypeScript runtime flags and an additive ABI v1 host dispatcher. Owned, revocable runtime calls accept immediate or cross-thread replies; blocking callback reentry fails with BUSY. Added parallel-instance, caller-thread, cancellation/deadline/reuse and real C header/library tests. Corrected parity evidence for existing C cancellation and mounts. Windows import libraries include every runtime symbol; header/Rust/definition inventory checks prevent missing exports. See [C API](runtimes/c-api.md).

@@ -598,7 +598,12 @@ pub use builtins::{
     TypeScriptLimits,
 };
 // Re-export zapcode-core types needed by external handler consumers.
-#[cfg(feature = "typescript")]
+#[cfg(all(feature = "typescript", target_arch = "wasm32", target_os = "unknown"))]
+pub use zapcode_browser::Value as ZapcodeValue;
+#[cfg(all(
+    feature = "typescript",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 pub use zapcode_core::Value as ZapcodeValue;
 
 /// Logging utilities module
@@ -8625,3 +8630,10 @@ echo missing fi"#,
         // server, but the hook is wired and the build succeeded.
     }
 }
+
+// Browser-only upstream source retains VM limits; native builds keep the
+// external crate and its public value types. See runtimes/zapcode-runtime.md.
+#[cfg(all(feature = "typescript", target_arch = "wasm32", target_os = "unknown"))]
+#[rustfmt::skip]
+#[allow(dead_code, unused_imports, clippy::all, clippy::unwrap_used)]
+mod zapcode_browser;
